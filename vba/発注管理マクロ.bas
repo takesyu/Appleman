@@ -11,6 +11,12 @@ Option Explicit
 '                                非表示で発注割れシートに残す）
 '   予約分を復活             : 予約発注リストの予定日到来分を発注可能に戻す
 '   発注点割れデータを取込   : レセコン出力CSVを発注点割れデータへ全入替
+'
+'   入荷待ちリストの整理（取込時・振り分け時に自動実行）
+'     ・発注点割れデータに無くなった品目 → 入荷済みとしてリストから削除
+'     ・登録から NYUKA_ALERT_DAYS 日以上たっても残っている品目
+'       → 状態を「要確認」にする（色分け解除・バーコード再表示）
+'         まだ入荷待ちなら F列で再度「入荷待ち」を選べば登録日が更新される
 '==============================================================
 
 Private Const SH_MAIN   As String = "発注割れ"
@@ -20,6 +26,9 @@ Private Const SH_MASTER  As String = "マスタ"
 Private Const SH_DATA    As String = "発注点割れデータ"
 Private Const FIRST_ROW  As Long = 3
 Private Const LAST_ROW   As Long = 200
+Private Const NYUKA_ALERT_DAYS As Long = 7      ' 入荷待ちを「要確認」にするまでの日数
+Private Const ST_NYUKA   As String = "入荷待ち"
+Private Const ST_ALERT   As String = "要確認"
 
 '--------------------------------------------------------------
 ' ① 予約と入荷待ちを振り分け
@@ -40,37 +49,21 @@ Public Sub 予約と入荷待ちを振り分け()
     Application.Calculation = xlCalculationManual
     Application.Calculate
 
-    '--- 1. 入荷待ちリストのクリーンアップ --------------------
-    '   今日の「発注割れ」C列(JAN)に無い＝入庫して発注点超え
-    Dim todayCodes As Object
-    Set todayCodes = CreateObject("Scripting.Dictionary")
-    todayCodes.CompareMode = vbTextCompare
+    '--- 1. 入荷待ちリストの整理 ------------------------------
+    '   発注点割れデータに無い＝入庫して発注点超え → 削除
+    '   長期間残っている → 要確認
+    Dim relCnt As Long, alertCnt As Long, relList As String, alertList As String
+    CleanupNyuka relCnt, relList, alertCnt, alertList
 
-    Dim code As String
-    For i = FIRST_ROW To LAST_ROW
-        code = NormCode(wsM.Cells(i, 3).Value)
-        If Len(code) > 0 And code <> "JAN未登録" Then
-            If Not todayCodes.Exists(code) Then todayCodes.Add code, True
-        End If
-    Next i
-
-    Dim nLast As Long
-    nLast = LastDataRow(wsN, 1)
-    For i = nLast To 2 Step -1
-        code = NormCode(wsN.Cells(i, 1).Value)
-        If Len(code) > 0 Then
-            If Not todayCodes.Exists(code) Then wsN.Rows(i).Delete
-        End If
-    Next i
-
-    '--- 2. 既存の入荷待ちコード集合を作成 -------------------
+    '--- 2. 既存の入荷待ち（キー → 行番号）を作成 -------------
     Dim nyukaSet As Object
     Set nyukaSet = CreateObject("Scripting.Dictionary")
     nyukaSet.CompareMode = vbTextCompare
+    Dim nLast As Long, key As String
     nLast = LastDataRow(wsN, 1)
     For i = 2 To nLast
-        code = NormCode(wsN.Cells(i, 1).Value)
-        If Len(code) > 0 And Not nyukaSet.Exists(code) Then nyukaSet.Add code, True
+        key = NyukaKey(wsN.Cells(i, 1).Value, wsN.Cells(i, 2).Value)
+        If Len(key) > 0 And Not nyukaSet.Exists(key) Then nyukaSet.Add key, i
     Next i
 
     '--- 3. F列を走査して振り分け（発注点割れデータは削除しない） ---
@@ -103,16 +96,20 @@ Public Sub 予約と入荷待ちを振り分け()
                     moved = moved + 1
 
                 Else    ' 入荷待ち
-                    If Not nyukaSet.Exists(NormCode(rawCode)) Then
+                    key = NyukaKey(rawCode, nm)
+                    If nyukaSet.Exists(key) Then
+                        ' 登録済み（要確認を含む）→ 入荷待ちに戻して登録日を更新
+                        rn = nyukaSet(key)
+                    Else
                         rn = LastDataRow(wsN, 1) + 1
                         If rn < 2 Then rn = 2
                         wsN.Cells(rn, 1).Value = rawCode
                         wsN.Cells(rn, 2).Value = nm
-                        wsN.Cells(rn, 3).Value = qty
-                        wsN.Cells(rn, 4).Value = Date
-                        wsN.Cells(rn, 5).Value = "入荷待ち"
-                        If Len(NormCode(rawCode)) > 0 Then nyukaSet.Add NormCode(rawCode), True
+                        nyukaSet.Add key, rn
                     End If
+                    wsN.Cells(rn, 3).Value = qty
+                    wsN.Cells(rn, 4).Value = Date
+                    wsN.Cells(rn, 5).Value = ST_NYUKA
                     moved = moved + 1
                 End If
             End If
@@ -126,7 +123,8 @@ Public Sub 予約と入荷待ちを振り分け()
     Application.CalculateFull
     Application.ScreenUpdating = True
     MsgBox moved & " 件を振り分けました。" & vbCrLf & _
-           "（予約中＝水色 / 入荷待ち＝ピンク で一覧に残ります。バーコードは非表示になります）", _
+           "（予約中＝水色 / 入荷待ち＝ピンク で一覧に残ります。バーコードは非表示になります）" & _
+           NyukaSummary(relCnt, relList, alertCnt, alertList), _
            vbInformation, "予約・入荷待ちの振り分け"
     Exit Sub
 EH:
@@ -407,6 +405,10 @@ Public Sub 発注点割れデータを取込()
     ' 書き込み
     wsD.Range(wsD.Cells(2, 1), wsD.Cells(nOut + 1, 16)).Value = outArr
 
+    ' 入荷待ちリストの整理（入荷済みの削除・長期滞留の要確認化）
+    Dim relCnt As Long, alertCnt As Long, relList As String, alertList As String
+    CleanupNyuka relCnt, relList, alertCnt, alertList
+
     Application.Calculation = savedCalc
     Application.CalculateFull
     Application.ScreenUpdating = True
@@ -414,7 +416,13 @@ Public Sub 発注点割れデータを取込()
     Dim doneMsg As String
     doneMsg = "取込完了：" & nOut & " 件を「発注点割れデータ」に書き込みました。"
     If excluded > 0 Then doneMsg = doneMsg & vbCrLf & "（予約中 " & excluded & " 件を除外）"
-    MsgBox doneMsg, vbInformation, "発注点割れデータの取込"
+    If nOut > LAST_ROW - FIRST_ROW + 1 Then
+        doneMsg = doneMsg & vbCrLf & vbCrLf & "※ 件数が「発注割れ」シートの表示上限（" & _
+                  (LAST_ROW - FIRST_ROW + 1) & " 件）を超えています。" & vbCrLf & _
+                  "　 超えた " & (nOut - (LAST_ROW - FIRST_ROW + 1)) & " 件は発注割れシートに表示されません。"
+    End If
+    doneMsg = doneMsg & NyukaSummary(relCnt, relList, alertCnt, alertList)
+    MsgBox doneMsg, IIf(alertCnt > 0, vbExclamation, vbInformation), "発注点割れデータの取込"
     Exit Sub
 EH:
     On Error Resume Next
@@ -435,6 +443,123 @@ End Function
 
 Private Function NormCode(ByVal v As Variant) As String
     NormCode = Trim$(CStr(v))
+End Function
+
+' 入荷待ちの照合キー。JANがあれば JAN、JAN未登録なら薬品名で照合する
+Private Function NyukaKey(ByVal code As Variant, ByVal nm As Variant) As String
+    Dim c As String, n As String
+    c = NormCode(code)
+    n = NormCode(nm)
+    If Len(c) > 0 And c <> "JAN未登録" Then
+        NyukaKey = "J:" & c
+    ElseIf Len(n) > 0 Then
+        NyukaKey = "N:" & n
+    Else
+        NyukaKey = ""
+    End If
+End Function
+
+' マスタ YJコード(トリム) -> JANコード（重複時は先頭行＝発注割れシートの VLOOKUP と同じ）
+Private Function BuildYj2Jan(ByVal wsMst As Worksheet) As Object
+    Dim d As Object, r As Long, mLast As Long, yjk As String
+    Set d = CreateObject("Scripting.Dictionary")
+    d.CompareMode = vbTextCompare
+    mLast = LastDataRow(wsMst, 2)
+    For r = 2 To mLast
+        yjk = Trim$(CStr(wsMst.Cells(r, 2).Value))
+        If Len(yjk) > 0 And Not d.Exists(yjk) Then d.Add yjk, Trim$(CStr(wsMst.Cells(r, 3).Value))
+    Next r
+    Set BuildYj2Jan = d
+End Function
+
+'--------------------------------------------------------------
+' 入荷待ちリストの整理
+'   ・発注点割れデータに無い品目 → 入荷済みと判断して行を削除
+'   ・入荷待ちのまま NYUKA_ALERT_DAYS 日以上 → 状態を「要確認」に変更
+'     （入荷後すぐ再び発注点を割った品目が発注できなくなるのを防ぐ）
+'   発注割れシートの表示上限（LAST_ROW）に関係なく、データ全件で判定する。
+'   発注点割れデータが空のときは何もしない（誤って全削除しないため）。
+'--------------------------------------------------------------
+Private Sub CleanupNyuka(ByRef relCnt As Long, ByRef relList As String, _
+                         ByRef alertCnt As Long, ByRef alertList As String)
+    Dim wsN As Worksheet, wsD As Worksheet
+    Set wsN = ThisWorkbook.Worksheets(SH_NYUKA)
+    Set wsD = ThisWorkbook.Worksheets(SH_DATA)
+
+    Dim dLast As Long
+    dLast = LastDataRow(wsD, 3)
+    If dLast < 2 Then Exit Sub
+
+    Dim yj2jan As Object
+    Set yj2jan = BuildYj2Jan(ThisWorkbook.Worksheets(SH_MASTER))
+
+    ' 現在の発注点割れ品目のキー集合（JAN と 薬品名の両方）
+    Dim curSet As Object
+    Set curSet = CreateObject("Scripting.Dictionary")
+    curSet.CompareMode = vbTextCompare
+    Dim r As Long, yjk As String, jan As String, key As String
+    For r = 2 To dLast
+        yjk = Trim$(CStr(wsD.Cells(r, 16).Value))
+        jan = ""
+        If Len(yjk) > 0 Then If yj2jan.Exists(yjk) Then jan = yj2jan(yjk)
+        key = NyukaKey(jan, "")
+        If Len(key) > 0 And Not curSet.Exists(key) Then curSet.Add key, True
+        key = NyukaKey("", wsD.Cells(r, 3).Value)
+        If Len(key) > 0 And Not curSet.Exists(key) Then curSet.Add key, True
+    Next r
+
+    Dim nLast As Long, i As Long, nm As String, stt As String, d As Variant
+    nLast = LastDataRow(wsN, 1)
+    For i = nLast To 2 Step -1
+        key = NyukaKey(wsN.Cells(i, 1).Value, wsN.Cells(i, 2).Value)
+        If Len(key) > 0 Then
+            nm = NormCode(wsN.Cells(i, 2).Value)
+            If Not curSet.Exists(key) Then
+                wsN.Rows(i).Delete
+                relCnt = relCnt + 1
+                AddNameToList relList, relCnt, nm
+            Else
+                stt = NormCode(wsN.Cells(i, 5).Value)
+                If stt = ST_NYUKA Then
+                    d = wsN.Cells(i, 4).Value
+                    If IsDate(d) Then
+                        If Date - CDate(d) >= NYUKA_ALERT_DAYS Then
+                            wsN.Cells(i, 5).Value = ST_ALERT
+                            stt = ST_ALERT
+                        End If
+                    End If
+                End If
+                If stt = ST_ALERT Then
+                    alertCnt = alertCnt + 1
+                    AddNameToList alertList, alertCnt, nm
+                End If
+            End If
+        End If
+    Next i
+End Sub
+
+' メッセージ用の品名リスト（10件まで表示）
+Private Sub AddNameToList(ByRef lst As String, ByVal cnt As Long, ByVal nm As String)
+    If cnt <= 10 Then
+        lst = lst & vbCrLf & "　・" & nm
+    ElseIf cnt = 11 Then
+        lst = lst & vbCrLf & "　　…ほか"
+    End If
+End Sub
+
+' 入荷待ちリスト整理結果のメッセージ文
+Private Function NyukaSummary(ByVal relCnt As Long, ByVal relList As String, _
+                              ByVal alertCnt As Long, ByVal alertList As String) As String
+    Dim s As String
+    If relCnt > 0 Then
+        s = s & vbCrLf & vbCrLf & "【入荷済みとして入荷待ちリストから削除】" & relCnt & " 件" & relList
+    End If
+    If alertCnt > 0 Then
+        s = s & vbCrLf & vbCrLf & "【要確認】入荷待ち登録から " & NYUKA_ALERT_DAYS & " 日以上たっても発注点割れのままです：" & _
+            alertCnt & " 件" & alertList & vbCrLf & _
+            "　入荷済みなら通常どおり発注、まだ未入荷なら F列で再度「入荷待ち」を選んでください。"
+    End If
+    NyukaSummary = s
 End Function
 
 ' CSVの取得元パスを解決する。
