@@ -128,10 +128,12 @@ Public Sub 予約と入荷待ちを振り分け()
            vbInformation, "予約・入荷待ちの振り分け"
     Exit Sub
 EH:
+    Dim errMsg As String
+    errMsg = "(" & Err.Number & ") " & Err.Description   ' On Error Resume Next で消える前に退避
     On Error Resume Next
     Application.Calculation = xlCalculationAutomatic
     Application.ScreenUpdating = True
-    MsgBox "エラーが発生しました：" & vbCrLf & Err.Description, vbExclamation, "予約・入荷待ちの振り分け"
+    MsgBox "エラーが発生しました：" & vbCrLf & errMsg, vbExclamation, "予約・入荷待ちの振り分け"
 End Sub
 
 '--------------------------------------------------------------
@@ -233,10 +235,12 @@ Public Sub 予約分を復活()
            vbInformation, "予約分の復活"
     Exit Sub
 EH:
+    Dim errMsg As String
+    errMsg = "(" & Err.Number & ") " & Err.Description   ' On Error Resume Next で消える前に退避
     On Error Resume Next
     Application.Calculation = xlCalculationAutomatic
     Application.ScreenUpdating = True
-    MsgBox "エラーが発生しました：" & vbCrLf & Err.Description, vbExclamation, "予約分の復活"
+    MsgBox "エラーが発生しました：" & vbCrLf & errMsg, vbExclamation, "予約分の復活"
 End Sub
 
 '==============================================================
@@ -273,7 +277,7 @@ Public Sub 発注点割れデータを取込()
     ' .ctl から対象日を取得（表示用・任意）
     taibiText = ""
     ctlPath = Left$(csvPath, InStrRev(csvPath, ".")) & "ctl"
-    If Len(Dir$(ctlPath)) > 0 Then
+    If CreateObject("Scripting.FileSystemObject").FileExists(ctlPath) Then
         Dim ctlLines() As String
         ctlLines = SplitLines(ReadTextSJIS(ctlPath))
         If UBound(ctlLines) >= 0 Then taibiText = Trim$(ctlLines(0))
@@ -425,10 +429,12 @@ Public Sub 発注点割れデータを取込()
     MsgBox doneMsg, IIf(alertCnt > 0, vbExclamation, vbInformation), "発注点割れデータの取込"
     Exit Sub
 EH:
+    Dim errMsg As String
+    errMsg = "(" & Err.Number & ") " & Err.Description   ' On Error Resume Next で消える前に退避
     On Error Resume Next
     Application.Calculation = xlCalculationAutomatic
     Application.ScreenUpdating = True
-    MsgBox "エラーが発生しました：" & vbCrLf & Err.Description, vbExclamation, "発注点割れデータの取込"
+    MsgBox "エラーが発生しました：" & vbCrLf & errMsg, vbExclamation, "発注点割れデータの取込"
 End Sub
 
 '--------------------------------------------------------------
@@ -563,21 +569,34 @@ Private Function NyukaSummary(ByVal relCnt As Long, ByVal relList As String, _
 End Function
 
 ' CSVの取得元パスを解決する。
-'   1) ブックと同じドライブの \発注割れシート\発注点割れ一覧表.csv
+'   1) ブックのフォルダから上へたどり、各階層の \発注割れシート\発注点割れ一覧表.csv
+'      （ドライブ文字 D:\… でも共有フォルダ \\サーバー\… でも同じように探せる）
 '   2) ブックと同じフォルダの 発注点割れ一覧表.csv
 '   3) 見つからなければファイル選択ダイアログ
 Private Function CsvSourcePath() As String
-    Dim base As String, p As String
+    Const CSV_DIR  As String = "発注割れシート"
+    Const CSV_NAME As String = "発注点割れ一覧表.csv"
+    Dim fso As Object, folder As String, parent As String, p As String, n As Long
+    Set fso = CreateObject("Scripting.FileSystemObject")
     CsvSourcePath = ""
-    base = ThisWorkbook.path
-    If Len(base) >= 2 Then
-        p = Left$(base, 2) & "\発注割れシート\発注点割れ一覧表.csv"
-        If Len(Dir$(p)) > 0 Then CsvSourcePath = p: Exit Function
-        p = base & "\発注点割れ一覧表.csv"
-        If Len(Dir$(p)) > 0 Then CsvSourcePath = p: Exit Function
+
+    folder = ThisWorkbook.path
+    Do While Len(folder) > 0 And n < 10
+        p = fso.BuildPath(fso.BuildPath(folder, CSV_DIR), CSV_NAME)
+        If fso.FileExists(p) Then CsvSourcePath = p: Exit Function
+        parent = fso.GetParentFolderName(folder)
+        If parent = folder Then Exit Do
+        folder = parent
+        n = n + 1
+    Loop
+
+    If Len(ThisWorkbook.path) > 0 Then
+        p = fso.BuildPath(ThisWorkbook.path, CSV_NAME)
+        If fso.FileExists(p) Then CsvSourcePath = p: Exit Function
     End If
+
     Dim fsel As Variant
-    fsel = Application.GetOpenFilename("CSVファイル (*.csv),*.csv", , "発注点割れ一覧表.csv を選択してください")
+    fsel = Application.GetOpenFilename("CSVファイル (*.csv),*.csv", , CSV_NAME & " を選択してください")
     If VarType(fsel) <> vbBoolean Then CsvSourcePath = CStr(fsel)
 End Function
 
